@@ -1,0 +1,21 @@
+# 环境
+.env
+.venv/
+
+# Python缓存
+__pycache__/
+*.pyc
+
+# 历史代码
+old_code/
+
+# 数据文件（重点）
+*.parquet
+*.csv
+data/
+datasets/
+stock_data/
+
+# IDE
+.vscode/
+.idea/
