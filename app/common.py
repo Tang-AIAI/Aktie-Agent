@@ -26,7 +26,9 @@ sys.path.insert(0, str(BASE_DIR))
 
 from data.paths import POSITIONS_FILE, SCREENER_STATE_FILE  # noqa: E402
 from quant.engine import run_strategy  # noqa: E402
+from quant.factors.registry import get_factor  # noqa: E402
 from quant.market_data import MarketDataLoader  # noqa: E402
+from quant.strategies import all_strategies, get_strategy  # noqa: E402
 from quant.strategies.strategy_a import StrategyA  # noqa: E402
 
 POSITIONS_COLUMNS = ["ts_code", "name", "quantity", "cost_price"]
@@ -55,6 +57,73 @@ def compute_strategy_a(as_of: str, dv: str):
 def latest_as_of(loader: MarketDataLoader = None) -> str:
     loader = loader or MarketDataLoader()
     return str(loader.latest_trade_date())
+
+
+# ---------------------------------------------------------------- 策略选择与因子参数侧边栏
+def factor_direction_text(direction: str) -> str:
+    return "越高越好 ↑" if direction == "higher_better" else "越低越好 ↓"
+
+
+def _strategy_label(name: str) -> str:
+    cls = next(s for s in all_strategies() if s.name == name)
+    return cls.label + ("" if cls.data_available else "（数据不足）")
+
+
+def strategy_sidebar(prefix: str) -> dict:
+    """侧边栏共享块：策略选择（A~F）+ 该策略的因子参数输入。
+
+    权重/窗口默认值直接读取策略定义（default_weights/default_windows，
+    缺省退回 Factor 定义），不在 UI 里硬编码第二套默认值。
+    数据不足的策略（B/C）显示 unavailable_reason 并禁用计算。
+
+    返回 {"name": 策略注册名, "cls": 策略类, "available": 可计算,
+         "weights": {因子: 权重%}, "windows": {因子: 窗口tuple},
+         "ok": 权重合计=100 且窗口合法（页面据此禁用按钮）}。
+    widget key 带 prefix（同一页面多实例/不同页面间不冲突）。
+    """
+    names = [s.name for s in all_strategies()]
+    name = st.sidebar.selectbox("策略（A~F）", names, format_func=_strategy_label)
+    cls = next(s for s in all_strategies() if s.name == name)
+    st.sidebar.caption(cls.description)
+    weights_in, windows_in = {}, {}
+    if not cls.data_available:
+        st.sidebar.error(cls.unavailable_reason)
+        return {"name": name, "cls": cls, "available": False,
+                "weights": {}, "windows": {}, "ok": False}
+
+    st.sidebar.subheader("因子参数（默认值取自策略定义，非最优）")
+    for spec in (get_factor(f) for f in cls.factor_names):
+        st.sidebar.markdown(f"**{spec.label}** · {factor_direction_text(spec.direction)}")
+        default_w = cls.default_weights.get(spec.name, 0)
+        wdef = cls.default_windows.get(spec.name, spec.default_windows)
+        if len(spec.default_windows) == 2:      # 双窗口因子（量能趋势/趋势）
+            short = st.sidebar.number_input(
+                "短期窗口（日）", min_value=2, value=wdef[0], step=5,
+                key=f"{prefix}_{name}_{spec.name}_short")
+            long = st.sidebar.number_input(
+                "长期窗口（日）", min_value=2, value=wdef[1], step=5,
+                key=f"{prefix}_{name}_{spec.name}_long")
+            windows_in[spec.name] = (short, long)
+        else:
+            w = st.sidebar.number_input(
+                "窗口（日）", min_value=2, value=wdef[0], step=5,
+                key=f"{prefix}_{name}_{spec.name}")
+            windows_in[spec.name] = (w,)
+        weights_in[spec.name] = st.sidebar.number_input(
+            f"{spec.short_label or spec.label} 权重（%）", min_value=0, max_value=100,
+            value=round(default_w * 100), step=5,
+            key=f"{prefix}_{name}_{spec.name}_w")
+    weight_sum = sum(weights_in.values())
+    weight_ok = abs(weight_sum - 100.0) < 1e-9
+    window_ok = all(w[0] < w[1] for w in windows_in.values() if len(w) == 2)
+    if not weight_ok:
+        st.sidebar.warning(f"权重合计 {weight_sum:.0f}%，必须等于 100% 才能计算。")
+    if not window_ok:
+        st.sidebar.warning("双窗口因子的短期窗口必须小于长期窗口。")
+    st.sidebar.caption("权重合计：**{:.0f}%**".format(weight_sum))
+    return {"name": name, "cls": cls, "available": True,
+            "weights": weights_in, "windows": windows_in,
+            "ok": weight_ok and window_ok}
 
 
 # ---------------------------------------------------------------- 持仓（本地 CSV）

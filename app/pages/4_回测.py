@@ -19,23 +19,16 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from app.common import data_version
+from app.common import data_version, strategy_sidebar
 from quant.backtest.runner import run_backtest
-from quant.factors.registry import get_factor
 from quant.market_data import MarketDataLoader
-from quant.strategies import all_strategies, get_strategy
+from quant.strategies import get_strategy
 
 st.set_page_config(page_title="回测 · 策略库", page_icon="🧪", layout="wide")
 
-STRATEGY_BY_NAME = {s.name: s for s in all_strategies()}
 # 沪深300 指数数据起点 2002-01-04 + 60 交易日因子窗口缓冲 → 最早可用回测起点
 EARLIEST_START = pd.Timestamp("20020501")
 INITIAL_CASH = 1_000_000.0
-
-
-def _strategy_label(name: str) -> str:
-    cls = STRATEGY_BY_NAME[name]
-    return cls.label + ("" if cls.data_available else "（数据不足）")
 
 
 # ---------------------------------------------------------------- 回测（带缓存）
@@ -48,10 +41,6 @@ def _run(strategy_name: str, start: str, end: str, top_n: int, period: int,
                    use_stock_list=False)
     return run_backtest(strategy, start, end, top_n=top_n, rebalance_every=period,
                         cost_rate=cost_pct / 100.0)
-
-
-def _direction_text(direction: str) -> str:
-    return "越高越好 ↑" if direction == "higher_better" else "越低越好 ↓"
 
 
 loader = MarketDataLoader()
@@ -68,11 +57,8 @@ st.sidebar.caption(
     "Top N 等权、次一交易日开盘价成交（停牌不成交）。")
 st.sidebar.caption("首次运行约 3~6 分钟（近 5 年），参数不变时重复运行即时返回缓存。")
 
-strategy_name = st.sidebar.selectbox(
-    "策略（A~F，统一回测流程）", list(STRATEGY_BY_NAME),
-    format_func=_strategy_label, index=0)
-strategy_cls = STRATEGY_BY_NAME[strategy_name]
-st.sidebar.caption(strategy_cls.description)
+sel = strategy_sidebar(prefix="bt")
+strategy_name, strategy_cls = sel["name"], sel["cls"]
 
 start_date = st.sidebar.date_input(
     "开始日期（默认近 5 年）",
@@ -89,56 +75,20 @@ period = st.sidebar.number_input("调仓周期（交易日）", min_value=1, max
 cost_pct = st.sidebar.number_input("单边交易成本（%）", min_value=0.0, max_value=1.0,
                                    value=0.1, step=0.05, format="%.2f")
 
-factors = [get_factor(f) for f in strategy_cls.factor_names]
-weights_in, windows_in = {}, {}
-if strategy_cls.data_available:
-    st.sidebar.subheader("因子参数（Baseline 默认值，非最优）")
-    for spec in factors:
-        st.sidebar.markdown(f"**{spec.label}** · {_direction_text(spec.direction)}")
-        default_w = strategy_cls.default_weights.get(spec.name, 0)
-        if len(spec.default_windows) == 2:      # 双窗口因子（量能趋势/趋势）
-            short = st.sidebar.number_input(
-                "短期窗口（日）", min_value=2, value=spec.default_windows[0], step=5,
-                key=f"bt_{strategy_name}_{spec.name}_short")
-            long = st.sidebar.number_input(
-                "长期窗口（日）", min_value=2, value=spec.default_windows[1], step=5,
-                key=f"bt_{strategy_name}_{spec.name}_long")
-            windows_in[spec.name] = (short, long)
-        else:
-            w = st.sidebar.number_input(
-                "窗口（日）", min_value=2, value=spec.default_windows[0], step=5,
-                key=f"bt_{strategy_name}_{spec.name}")
-            windows_in[spec.name] = (w,)
-        weights_in[spec.name] = st.sidebar.number_input(
-            f"{spec.short_label or spec.label} 权重（%）", min_value=0, max_value=100,
-            value=round(default_w * 100), step=5,
-            key=f"bt_{strategy_name}_{spec.name}_w")
-
-weight_sum = sum(weights_in.values())
-weight_ok = abs(weight_sum - 100.0) < 1e-9 if strategy_cls.data_available else False
-window_ok = all(w[0] < w[1] for w in windows_in.values() if len(w) == 2)
 dates_ok = end_date > start_date
-if strategy_cls.data_available:
-    if not weight_ok:
-        st.sidebar.warning(f"权重合计 {weight_sum:.0f}%，必须等于 100% 才能运行。")
-    if not window_ok:
-        st.sidebar.warning("双窗口因子的短期窗口必须小于长期窗口。")
-    st.sidebar.caption("权重合计：**{:.0f}%**".format(weight_sum))
-else:
-    st.sidebar.error(strategy_cls.unavailable_reason)
 if not dates_ok:
     st.sidebar.warning("结束日期必须晚于开始日期。")
 
 run = st.sidebar.button(
     "运行回测", type="primary",
-    disabled=not (strategy_cls.data_available and weight_ok and window_ok and dates_ok))
+    disabled=not (sel["available"] and sel["ok"] and dates_ok))
 if run:
     st.session_state["bt_result"] = _run(
         strategy_name,
         start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"),
         top_n, period, cost_pct,
-        tuple(weights_in.items()),
-        tuple((n, ws) for n, ws in windows_in.items()),
+        tuple(sel["weights"].items()),
+        tuple((n, ws) for n, ws in sel["windows"].items()),
         data_version(loader))
 result = st.session_state.get("bt_result")
 

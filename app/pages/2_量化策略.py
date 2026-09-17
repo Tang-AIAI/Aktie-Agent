@@ -1,11 +1,13 @@
-"""Strategy A 页面：参数输入 → 重新计算 → Top 10 排名 + 个股因子构成。
+"""统一多策略实时排名页：选择策略（A~F）→ 参数 → 当前截面排名（Top 10 + 因子构成）。
 
-页面只负责 UI（参数输入、触发计算、结果展示），策略逻辑全部在 quant/ 包：
+页面只负责 UI（策略选择、参数输入、触发计算、结果展示），策略计算全部在 quant/：
 - 因子定义与计算：quant/factors/
-- 策略配置（权重/窗口）：quant/strategies/strategy_a.py
-- 标准化 + 加权 + 排名：quant/engine.py
+- 策略配置（权重/窗口/数据可用性）：quant/strategies/
+- 标准化 + 加权 + 排名：quant/engine.py（与回测页同一套 Engine）
 
-注意：Strategy A 是 baseline 研究策略，未经过历史回测验证。
+本页回答"按照这个策略，今天当前股票池中哪些股票排名靠前？"；
+历史模拟表现请到「回测」页（同一 Engine，一个是当前截面排名，一个是历史模拟）。
+B/C 显示数据不足原因并禁用计算，不伪造数据、不产生排名。
 """
 
 import sys
@@ -17,93 +19,81 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from app.common import data_version, factor_direction_text, strategy_sidebar
 from quant.engine import run_strategy
-from quant.factors.base import HIGHER_BETTER
 from quant.factors.registry import get_factor
 from quant.market_data import MarketDataLoader
-from quant.strategies.strategy_a import StrategyA
+from quant.strategies import get_strategy
 
-st.set_page_config(page_title="量化策略 · Strategy A", page_icon="📈", layout="wide")
+st.set_page_config(page_title="量化策略 · 实时排名", page_icon="📈", layout="wide")
 
-FACTORS = [get_factor(f) for f in StrategyA.factor_names]
 
 # ---------------------------------------------------------------- 计算（带缓存）
-@st.cache_data(show_spinner="正在计算 Strategy A 排名…")
-def _compute(as_of: str, weights: tuple, windows: tuple):
-    """权重/窗口以 tuple 传入保证可哈希缓存；参数不变时直接命中缓存。"""
-    strategy = StrategyA(weights=dict(weights), windows=dict(windows))
+@st.cache_data(show_spinner="正在计算策略排名…")
+def _compute(strategy_name: str, as_of: str, weights: tuple, windows: tuple, dv: str):
+    """权重/窗口以 tuple 传入保证可哈希；缓存键含策略名与数据版本。"""
+    cls = get_strategy(strategy_name)
+    strategy = cls(weights=dict(weights), windows=dict(windows))
     return run_strategy(strategy, as_of=as_of)
 
 
-# ---------------------------------------------------------------- 侧边栏参数
-def _direction_text(direction: str) -> str:
-    return "越高越好 ↑" if direction == HIGHER_BETTER else "越低越好 ↓"
-
-
 loader = MarketDataLoader()
-st.sidebar.title("Strategy A")
-st.sidebar.caption("调整参数后点击「重新计算」生成新排名。")
-
 try:
     latest = loader.latest_trade_date()
 except Exception as e:  # 数据文件缺失/损坏
     st.error(f"无法读取数据文件：{e}\n\n请先运行 `scripts/update_stock_data.py`。")
     st.stop()
 
+# ---------------------------------------------------------------- 侧边栏参数
+st.sidebar.title("量化策略")
+st.sidebar.caption("选择策略并调整参数后，点击「重新计算」生成当前排名。")
+
+sel = strategy_sidebar(prefix="sp")
+strategy_name, strategy_cls = sel["name"], sel["cls"]
+FACTORS = [get_factor(f) for f in strategy_cls.factor_names]
+
 as_of_date = st.sidebar.date_input("计算日期（默认最新交易日）", value=pd.Timestamp(latest))
 as_of = as_of_date.strftime("%Y%m%d")
 
-weights_in, windows_in = {}, {}
-st.sidebar.subheader("因子参数")
-for spec in FACTORS:
-    st.sidebar.markdown(f"**{spec.label}** · {_direction_text(spec.direction)}")
-    if len(spec.default_windows) == 2:      # Volume Trend：双窗口
-        short = st.sidebar.number_input(
-            "短期窗口（日）", min_value=2, value=spec.default_windows[0], step=5,
-            key=f"win_{spec.name}_short")
-        long = st.sidebar.number_input(
-            "长期窗口（日）", min_value=2, value=spec.default_windows[1], step=5,
-            key=f"win_{spec.name}_long")
-        windows_in[spec.name] = (short, long)
-    else:
-        w = st.sidebar.number_input(
-            "窗口（日）", min_value=2, value=spec.default_windows[0], step=5,
-            key=f"win_{spec.name}")
-        windows_in[spec.name] = (w,)
-    weights_in[spec.name] = st.sidebar.number_input(
-        f"{spec.short_label or spec.label} 权重（%）", min_value=0, max_value=100,
-        value=25, step=5, key=f"w_{spec.name}")
-
-weight_sum = sum(weights_in.values())
-weight_ok = abs(weight_sum - 100.0) < 1e-9
-window_ok = all(w[0] < w[1] for w in windows_in.values() if len(w) == 2)
-if not weight_ok:
-    st.sidebar.warning(f"权重合计 {weight_sum:.0f}%，必须等于 100% 才能计算。")
-if not window_ok:
-    st.sidebar.warning("量能趋势的短期窗口必须小于长期窗口。")
-st.sidebar.caption("权重合计：**{:.0f}%**".format(weight_sum))
-
-run = st.sidebar.button("重新计算", type="primary", disabled=not (weight_ok and window_ok))
+run = st.sidebar.button("重新计算", type="primary",
+                        disabled=not (sel["available"] and sel["ok"]))
 if run:
-    st.session_state["result"] = _compute(
-        as_of, tuple(weights_in.items()), tuple((n, ws) for n, ws in windows_in.items()))
-result = st.session_state.get("result")
+    st.session_state["sp_result"] = (strategy_name, _compute(
+        strategy_name, as_of,
+        tuple(sel["weights"].items()),
+        tuple((n, ws) for n, ws in sel["windows"].items()),
+        data_version(loader)))
+held = st.session_state.get("sp_result")
+# 已切换策略时旧结果不展示（避免显示其他策略的排名造成误导）
+result = held[1] if held and held[0] == strategy_name else None
 
 # ---------------------------------------------------------------- 主区域
-st.title("Strategy A · 量化评分排名")
-st.caption("Strategy A 是 baseline 策略，未经过历史回测验证，"
-           "结果仅供量化研究参考，不构成投资建议。")
+st.title(f"{strategy_cls.label} · 量化评分排名")
+st.caption("当前截面排名：按照所选策略，当前股票池中哪些股票排名靠前。"
+           "历史表现请到「回测」页，两者使用同一套策略引擎。")
+
+if not sel["available"]:
+    st.error(strategy_cls.unavailable_reason)
+    st.info("该策略的设计说明与数据依赖见 PROJECT_CONTEXT.md「策略库」一节。"
+            "接入可靠的历史 PIT 估值/财务数据前不计算、不产生排名。")
+    st.stop()
+
+if strategy_name == "strategy_a":
+    st.warning(
+        "当前 Strategy A 的 Momentum 与 Relative Strength 横截面 score 恒等，"
+        "因此实际综合权重相当于 Momentum 50%、Volatility 25%、Volume Trend 25%。"
+        "（已记录为 Strategy A v2 改进点，本页按现行定义执行。）")
 
 if result is None:
-    st.info("在左侧调整策略参数后，点击「重新计算」查看最新排名。")
+    st.info("在左侧选择策略并调整参数后，点击「重新计算」查看当前排名。")
     st.stop()
 
 for wmsg in result.warnings:
     st.warning(wmsg)
 
 # 参数已修改但未重算时提示
-current_ok = (dict(weights_in) == {f: int(round(v * 100)) for f, v in result.weights.items()}
-              and dict(windows_in) == result.windows)
+current_ok = (dict(sel["weights"]) == {f: int(round(v * 100)) for f, v in result.weights.items()}
+              and dict(sel["windows"]) == result.windows)
 if not current_ok:
     st.info("参数已修改，点击左侧「重新计算」后生效。当前显示的是上一次计算结果。")
 
@@ -160,7 +150,7 @@ if sel_event.selection.rows:
 # ---------------------------------------------------------------- 参数与完整排名
 with st.expander("策略参数（本次计算）"):
     params = pd.DataFrame([{
-        "因子": spec.label, "方向": _direction_text(spec.direction),
+        "因子": spec.label, "方向": factor_direction_text(spec.direction),
         "窗口": " / ".join(str(w) for w in result.windows[spec.name]),
         "权重": f"{result.weights[spec.name]:.0%}",
     } for spec in FACTORS])
@@ -195,7 +185,7 @@ for spec in FACTORS:
     w = result.weights[spec.name]
     detail_rows.append({
         "因子": spec.label,
-        "方向": _direction_text(spec.direction),
+        "方向": factor_direction_text(spec.direction),
         "窗口": " / ".join(str(x) for x in result.windows[spec.name]),
         "权重": f"{w:.0%}",
         "原始值": raw_v,
@@ -241,5 +231,5 @@ with st.expander("计算方法说明"):
     st.markdown(
         "- 每个因子在计算日的股票池内做横截面 z-score 标准化（`(x − mean) / std`，"
         "总体标准差），\"越低越好\"的因子乘 −1 反转方向；\n"
-        "- Strategy Score = 四个标准化因子得分 × 各自权重之和；\n"
+        "- Strategy Score = 各标准化因子得分 × 各自权重之和；\n"
         "- 排除规则：无当日行情（停牌/退市）、任一因子数据不足、不在 stock_list.csv 中的股票。")

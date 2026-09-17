@@ -1,6 +1,9 @@
 # PROJECT_CONTEXT — 个人股票量化研究 Web App
 
-> 最后更新：2026-09-17（策略库建立：Strategy A~F 注册表统一接入引擎与回测；
+> 最后更新：2026-09-17（量化策略页改造为统一多策略实时排名页：A~F 可选、B/C 显示
+> 数据不足并禁用；侧边栏抽为 app/common.strategy_sidebar 与回测页共用；
+> 163 单元测试全过、双页浏览器冒烟 13 项全过）
+> 2026-09-17（策略库建立：Strategy A~F 注册表统一接入引擎与回测；
 > B/C 因缺数据只做设计说明，D/E/F 完整实现并回测验证；150 单元测试全过、
 > 回测页策略选择器冒烟 12 项全过）
 > 2026-09-17（Strategy A 历史回测 MVP 完成：quant/backtest/ + pages/4_回测.py，
@@ -31,11 +34,12 @@ quant/
 ├── scripts/     # update_stock_data / update_index_data / backfill_adj_factor / rebuild_adj / check_data
 ├── app/         # Web App（默认多页模式）：
 │                #   Home.py            首页 Dashboard（数据状态/持仓/Strategy A Top 10/选股入口）
-│                #   common.py          共享：Strategy A 计算缓存、持仓读写+估值、更新流水线、选股状态持久化
+│                #   common.py          共享：Strategy A 计算缓存、持仓读写+估值、更新流水线、选股状态持久化、
+│                #                      strategy_sidebar（策略选择+动态因子参数侧边栏，量化策略/回测两页共用）
 │                #   pages/1_数据管理.py  五类数据状态 + 一键更新（子进程跑 scripts/，日志流式+持久化）
-│                #   pages/2_量化策略.py  Strategy A 页面（沿用已验证实现，仅路径调整）
+│                #   pages/2_量化策略.py  统一多策略实时排名页（A~F 可选，B/C 显示数据不足并禁用）
 │                #   pages/3_条件选股.py  可视化条件构建器（12 指标 × 6 运算符 × 数值/指标右值 × AND/OR/NOT）
-│                #   pages/4_回测.py     Strategy A 历史回测页（区间/TopN/调仓周期/成本率/权重窗口，
+│                #   pages/4_回测.py     策略历史回测页（区间/TopN/调仓周期/成本率/权重窗口，
 │                #                       指标卡片 + 净值曲线 + 调仓记录 + 参数快照 + 数据版本）
 ├── quant/       # 量化引擎：
 │                #   market_data.py     区间+列裁剪读取 parquet（内存缓存，key 含文件 mtime/size）+ data_status/calendar_status/load_latest_prices
@@ -189,13 +193,21 @@ positions.csv（ts_code/name/quantity/cost_price，UTF-8，原子写入）；现
   接口已接入注册表与页面，设计定义与数据依赖（含 PIT 要求）写在类 docstring
   与 data_requirements 字段，未来接入可靠数据后填 factor_names 即可运行
 
-### 回测页（pages/4_回测.py）策略选择
+### 两个页面共用同一 Engine（页面职责划分）
 
-- 侧边栏策略选择器（A~F，B/C 标注"数据不足"）；选择后因子侧边栏按策略动态渲染，
-  默认权重/窗口取策略声明值
-- 选 B/C：显示 unavailable_reason + 运行按钮禁用 + 设计说明指引，不报错不误导
-- 选 A 时仍显示 RS≡Momentum 警示（A 专属）
-- 回测缓存键含策略名与数据版本
+- **量化策略页（pages/2_量化策略.py）**：当前截面排名——"按照这个策略，今天当前
+  股票池中哪些股票排名靠前？"（Top 10 / 完整排名 / 个股因子构成，与 Strategy A 时代
+  同布局）
+- **回测页（pages/4_回测.py）**：历史模拟——"如果按照这个策略在历史上进行交易，
+  结果如何？"
+- 两页共用 `app/common.strategy_sidebar(prefix)`：策略选择器（A~F，B/C 标注
+  "数据不足"）+ 按策略动态渲染的因子参数侧边栏；**权重/窗口默认值直接读取策略/
+  因子定义（default_weights/default_windows），UI 不硬编码第二套默认值**；
+  widget key 按 prefix 隔离
+- 选 B/C：两页均显示 unavailable_reason + 运行按钮禁用 + 设计说明指引，不报错不误导
+- 选 A 时两页均显示 RS≡Momentum 警示（A 专属）
+- 量化策略页：切换策略后旧结果不展示（提示重新计算）；计算缓存键含策略名与数据版本；
+  实盘页仍用 stock_list 过滤（live 口径），回测页用 PIT 股票池
 
 ### 新增策略的真实数据快检（2024-01 ~ 2025-12，Top10/20日/0.1%成本，如实记录）
 
@@ -335,5 +347,7 @@ D 的"接飞刀"亏损与无 ST 过滤一致；F 净值重建与成交价独立�
 - ✅ Strategy A 历史回测 MVP：quant/backtest/ + pages/4_回测.py（2026-09-17 完成，见上文）
 - ✅ 策略库 A~F：D/E/F 完整实现、B/C 设计壳（缺 PIT 财务数据）、回测页策略选择器
   （2026-09-17 完成，见"策略库"一节）
+- ✅ 量化策略页统一多策略：A~F 可选（B/C 显示数据不足并禁用）、侧边栏抽为共享
+  helper 与回测页共用（2026-09-17 完成）
 - ⬜ 后续：Strategy A v2（RS 残差 alpha / ST 过滤 / 股票池限制）、接入 PIT 估值/财务
   数据后实现 B/C、统一回测与参数实验（固定基线，非寻优）
