@@ -11,11 +11,18 @@ old_code/
 
 # 数据文件（重点）
 *.parquet
+*.parquet.backup
 *.csv
-data/
+*.log
+data_cache/
 datasets/
 stock_data/
 
 # IDE
 .vscode/
 .idea/
+backup_20260915/
+download_progress.txt
+failed_dates.txt
+sina_backfill_state.json
+sina_backfill_failed.txt

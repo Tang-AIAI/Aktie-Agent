@@ -1,17 +1,35 @@
-# 下载沪深300指数数据，先尝试tushare，没有权限的话就用akshare，并将数据进行统一规范（调用data_manager.py的核心程序）
-import pandas as pd
+#!/usr/bin/env python3
+"""沪深300 指数数据增量更新（从 update_daily_300_data.py 迁移，逻辑未改动）。
+
+Tushare 为主，无权限/失败时降级 AkShare；统一规范列名后合并去重保存。
+"""
+
+import sys
 import os
 import time
+from pathlib import Path
 from datetime import datetime
-from data_manager import DataManager
+
+import pandas as pd
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+from data.paths import INDEX_FILE  # noqa: E402
+from data.index_data import DataManager  # noqa: E402
+from data.storage import atomic_save  # noqa: E402
+
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8")
+
+load_dotenv(BASE_DIR / ".env")
 
 def update_index_data():
     """增量更新指数数据，继承用户风格"""
-    file_path = "index_data.parquet"
+    file_path = INDEX_FILE
     INDEX_CODE = "000300.SH"
 
     # 初始化数据管理器，替换Tushare token
@@ -51,7 +69,7 @@ def update_index_data():
         df_all = df_new
 
     df_all = df_all.sort_values(["ts_code", "trade_date"])
-    df_all.to_parquet(file_path, index=False)
+    atomic_save(df_all, file_path)
     logging.info(f"更新完成，总记录数：{len(df_all)}，保存至 {file_path}")
 
 

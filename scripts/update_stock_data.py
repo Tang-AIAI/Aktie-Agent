@@ -1,33 +1,46 @@
-# 每日更新程序
 #!/usr/bin/env python3
 """
-Tushare 数据下载器（稳健版）
+个股数据每日更新（从 new_update_daily_data.py 迁移，下载逻辑保持原样）
 - 日线：逐日下载 + batch_append（全量重写，可接受）
-- 复权因子：一次性批量请求 + 安全分页 + 高效追加更新
+- 复权因子：一次性批量请求 + 安全分页；adj_factor 限频 1次/分钟，页间等待 65s，
+  不再静默截断；下载后做覆盖率校验，不完整时提示运行 backfill_adj_factor.py
+- 交易日判断：data/trade_calendar.py（交易所日历 + 本地缓存）
+- 路径：统一从 data/paths.py 取，任意 cwd 均可运行
 """
 
-import tushare as ts
-import pandas as pd
+import sys
 import os
 import time
 import tempfile
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Set
+
+import tushare as ts
+import pandas as pd
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+from data.paths import RAW_FILE, FCT_FILE, ADJ_FILE, PROGRESS_FILE, FAILED_FILE  # noqa: E402
+from data.trade_calendar import get_trade_dates  # noqa: E402
+from data.storage import atomic_save, append_dedupe  # noqa: E402
+from data.adj_data import build_forward_adjusted  # noqa: E402
+
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8")
+
+load_dotenv(BASE_DIR / ".env")
 
 TOKEN = os.getenv("TUSHARE_TOKEN")
-RAW_FILE = "market_data_raw.parquet"
-FCT_FILE = "adj_factor.parquet"
-ADJ_FILE = "market_data_adj.parquet"
-PROGRESS_FILE = "download_progress.txt"
-FAILED_FILE = "failed_dates.txt"
-
 DAILY_INTERVAL = 0.35
 BATCH_SIZE = 30
 PAGE_LIMIT = 5000
 MAX_RETRIES = 3
+FCT_PAGE_INTERVAL = 65      # adj_factor 接口限频 1次/分钟
+FCT_MAX_RETRIES = 5
 
 ts.set_token(TOKEN)
 pro = ts.pro_api()
@@ -46,58 +59,18 @@ def safe_call(func, **kwargs) -> pd.DataFrame:
             time.sleep(2)
     return pd.DataFrame()
 
-def atomic_save(df: pd.DataFrame, filepath: str):
-    if df is None or df.empty:
-        return
-    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(suffix='.parquet', dir=os.path.dirname(filepath))
-    os.close(fd)
-    try:
-        df.to_parquet(tmp, index=False)
-        os.replace(tmp, filepath)
-    except Exception:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        raise
-
-# 日线的 batch_append（全量合并）
-def batch_append_daily(new_dfs: List[pd.DataFrame], filepath: str):
-    if not new_dfs:
-        return
-    combined = pd.concat(new_dfs, ignore_index=True)
-    if os.path.exists(filepath):
-        old = pd.read_parquet(filepath)
-        old['trade_date'] = old['trade_date'].astype(str)
-        combined = pd.concat([old, combined], ignore_index=True)
-    combined = combined.drop_duplicates(['ts_code', 'trade_date'])
-    combined = combined.sort_values(['ts_code', 'trade_date'])
-    atomic_save(combined, filepath)
-
-# 因子的高效追加更新
-def update_factors(new_factors: pd.DataFrame, factor_file: str):
-    if new_factors.empty:
-        return
-    new_factors['trade_date'] = new_factors['trade_date'].astype(str)
-    if os.path.exists(factor_file):
-        old = pd.read_parquet(factor_file)
-        old['trade_date'] = old['trade_date'].astype(str)
-        combined = pd.concat([old, new_factors], ignore_index=True)
-        combined = combined.drop_duplicates(['ts_code', 'trade_date'])
-        atomic_save(combined, factor_file)
-    else:
-        atomic_save(new_factors, factor_file)
-
-def get_trade_dates(start_date: str, end_date: str) -> List[str]:
-    try:
-        cal = pro.trade_cal(exchange='SSE', start_date=start_date, end_date=end_date)
-        if not cal.empty:
-            cal['cal_date'] = cal['cal_date'].astype(str)
-            cal['is_open'] = cal['is_open'].astype(str)
-            return cal[cal['is_open'] == '1']['cal_date'].tolist()
-    except Exception:
-        pass
-    all_dates = pd.date_range(start_date, end_date).strftime("%Y%m%d").tolist()
-    return [d for d in all_dates if datetime.strptime(d, "%Y%m%d").weekday() < 5]
+def safe_call_fct(func, **kwargs) -> pd.DataFrame:
+    """复权因子专用请求：限频 1次/分钟，失败后等 65s 重试。"""
+    for attempt in range(FCT_MAX_RETRIES):
+        try:
+            df = func(**kwargs)
+            if df is not None:
+                return df
+        except Exception as e:
+            print(f"      ⚠️ 请求失败（第 {attempt+1}/{FCT_MAX_RETRIES} 次）: {e}", flush=True)
+            if attempt < FCT_MAX_RETRIES - 1:
+                time.sleep(FCT_PAGE_INTERVAL)
+    return pd.DataFrame()
 
 def load_progress() -> Set[str]:
     if os.path.exists(PROGRESS_FILE):
@@ -136,27 +109,21 @@ def download_one_day(trade_date: str) -> pd.DataFrame:
         time.sleep(0.1)
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
-# ------------------ 因子下载（安全分页） ------------------
+# ------------------ 因子下载（限频感知分页） ------------------
 def download_factors_batch(start_date: str, end_date: str) -> pd.DataFrame:
     all_parts = []
     offset = 0
-    max_pages = 100
-    last_df = None
-    for _ in range(max_pages):
-        df = safe_call(pro.adj_factor, start_date=start_date, end_date=end_date,
-                       limit=PAGE_LIMIT, offset=offset)
+    max_pages = 200
+    for page in range(max_pages):
+        df = safe_call_fct(pro.adj_factor, start_date=start_date, end_date=end_date,
+                           limit=PAGE_LIMIT, offset=offset)
         if df.empty:
-            break
-        # 检测 offset 是否失效（重复数据）
-        if last_df is not None and df.equals(last_df):
-            print("      ⚠️ 分页参数无效，停止分页", flush=True)
             break
         all_parts.append(df)
         if len(df) < PAGE_LIMIT:
             break
-        last_df = df
         offset += PAGE_LIMIT
-        time.sleep(1)   # 分页间隔
+        time.sleep(FCT_PAGE_INTERVAL)   # 尊重 1次/分钟 限频
     if all_parts:
         combined = pd.concat(all_parts, ignore_index=True)
         combined['trade_date'] = combined['trade_date'].astype(str)
@@ -214,7 +181,7 @@ def main():
         if len(batch_dates) >= BATCH_SIZE or idx == len(trade_dates):
             try:
                 if batch_raw:
-                    batch_append_daily(batch_raw, RAW_FILE)
+                    append_dedupe(pd.concat(batch_raw, ignore_index=True), RAW_FILE)
                     print(f"  💾 批量写入 {len(batch_raw)} 天日线")
             except Exception as e:
                 print(f"  ❌ 批量写入失败: {e}，下次重试")
@@ -236,30 +203,31 @@ def main():
         print(f"⚠️ 失败日期记录在 {FAILED_FILE}")
 
     # ---------- 2. 一次性下载复权因子（整个日期范围） ----------
-    print("\n📊 正在批量下载复权因子...", flush=True)
+    print("\n📊 正在批量下载复权因子...（限频 1次/分钟，耐心等待）", flush=True)
     fct_df = download_factors_batch(start_date, today)
     if not fct_df.empty:
-        update_factors(fct_df, FCT_FILE)
+        fct_df["source"] = "tushare"
+        # keep="last"：Tushare 官方数据覆盖同键的新浪合成因子
+        append_dedupe(fct_df, FCT_FILE, keep="last")
         print(f"✅ 复权因子更新完成，新增 {len(fct_df)} 条记录")
+
+        # 覆盖率校验：本窗口因子行数应约等于窗口内日线行数（逐日逐股）
+        raw = pd.read_parquet(RAW_FILE)
+        raw['trade_date'] = raw['trade_date'].astype(str)
+        expected = ((raw['trade_date'] >= start_date) & (raw['trade_date'] <= today)).sum()
+        if len(fct_df) < expected * 0.98:
+            print(f"❌ 复权因子疑似截断：窗口内日线 {expected} 行，因子仅 {len(fct_df)} 条")
+            print(f"   请运行 python scripts/backfill_adj_factor.py 回补缺口")
     else:
         print("⚠️ 未获取到复权因子（可能权限不足或网络问题）")
 
     # ---------- 3. 生成前复权数据 ----------
     if os.path.exists(RAW_FILE) and os.path.exists(FCT_FILE):
-        print("\n📊 正在生成前复权数据...")
+        print("\n📊 正在生成前复权数据...", flush=True)
         try:
             raw = pd.read_parquet(RAW_FILE)
             fct = pd.read_parquet(FCT_FILE)
-            raw['trade_date'] = raw['trade_date'].astype(str)
-            fct['trade_date'] = fct['trade_date'].astype(str)
-
-            df = pd.merge(raw, fct, on=['ts_code', 'trade_date'], how='left')
-            df = df.sort_values(['ts_code', 'trade_date'])
-            df['adj_factor'] = df.groupby('ts_code')['adj_factor'].ffill().fillna(1)
-            last_factor = df.groupby('ts_code')['adj_factor'].transform('last')
-            for col in ['open', 'high', 'low', 'close']:
-                if col in df.columns:
-                    df[col + '_adj'] = df[col] * last_factor / df['adj_factor']
+            df = build_forward_adjusted(raw, fct)
             atomic_save(df, ADJ_FILE)
             print(f"✅ 前复权数据保存至 {ADJ_FILE}")
         except Exception as e:
